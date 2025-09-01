@@ -671,10 +671,14 @@ class PrecisionPersonalInfoExtractor:
             'demographics': {
                 'gender_age': re.compile(r'(Мужчина|Женщина),\s*(\d+)\s*лет?', re.IGNORECASE),
                 'birth_date': re.compile(r'родился\s*(\d{1,2}\s+\w+\s+\d{4})', re.IGNORECASE),
+                'birth_date_numeric': re.compile(r'родился\s*(\d{1,2}[./\-]\d{1,2}[./\-]\d{4})', re.IGNORECASE),
+                'birth_date_short': re.compile(r'дата рождения\s*:?\s*(\d{1,2}[./\-]\d{1,2}[./\-]\d{4})', re.IGNORECASE),
+                'birth_date_simple': re.compile(r'(\d{1,2}[./\-]\d{1,2}[./\-](19|20)\d{2})'),
                 'age_only': re.compile(r'(\d{1,2})\s*лет?', re.IGNORECASE)
             },
             'contacts': {
-                'phone': re.compile(r'\+7\s*\([0-9]{3}\)\s*[0-9]{7}'),
+                'phone': re.compile(r'(\+7|8|7)?[\s\-\.]?[\(\[]?[0-9]{3}[\)\]]?[\s\-\.]?[0-9]{3}[\s\-\.]?[0-9]{2}[\s\-\.]?[0-9]{2}'),
+                'phone_strict': re.compile(r'\+7\s*\([0-9]{3}\)\s*[0-9]{7}'),
                 'email': re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'),
                 'telegram': re.compile(r'telegram\s*@([\w\d_]+)', re.IGNORECASE),
                 'telegram_alt': re.compile(r'@([\w\d_]+)')
@@ -823,15 +827,44 @@ class PrecisionPersonalInfoExtractor:
                     'source': line
                 }
 
-            # Поиск даты рождения
-            birth_match = self.patterns['demographics']['birth_date'].search(line)
-            if birth_match:
-                results['birth_date'] = {
-                    'value': birth_match.group(1),
-                    'confidence': 0.9,
-                    'method': 'exact_pattern',
-                    'source': line
-                }
+        # Поиск даты рождения - сначала в отдельных строках, потом во всем тексте
+        birth_value = None
+        birth_confidence = 0.0
+        birth_source = None
+        
+        # Попробуем все паттерны даты рождения
+        birth_patterns = [
+            ('birth_date', 0.9),           # родился дата
+            ('birth_date_numeric', 0.85),  # родился ДД.ММ.ГГГГ
+            ('birth_date_short', 0.8),     # дата рождения:
+            ('birth_date_simple', 0.7)     # просто ДД.ММ.ГГГГ
+        ]
+        
+        # Сначала ищем в строках
+        for line in lines:
+            for pattern_name, confidence in birth_patterns:
+                birth_match = self.patterns['demographics'][pattern_name].search(line)
+                if birth_match and birth_confidence < confidence:
+                    birth_value = birth_match.group(1)
+                    birth_confidence = confidence
+                    birth_source = line
+        
+        # Если не нашли в строках, ищем во всем тексте
+        if not birth_value:
+            for pattern_name, confidence in birth_patterns:
+                birth_match = self.patterns['demographics'][pattern_name].search(full_text)
+                if birth_match and birth_confidence < confidence:
+                    birth_value = birth_match.group(1)
+                    birth_confidence = confidence * 0.9  # Немного снижаем уверенность
+                    birth_source = 'full_text_search'
+                
+        if birth_value:
+            results['birth_date'] = {
+                'value': birth_value,
+                'confidence': birth_confidence,
+                'method': 'pattern_match',
+                'source': birth_source
+            }
 
         return results
 
@@ -842,11 +875,16 @@ class PrecisionPersonalInfoExtractor:
         # Поиск телефона
         phone_match = self.patterns['contacts']['phone'].search(full_text)
         if phone_match:
+            phone_value = phone_match.group(0)
+            # Проверяем строгий формат для более высокой уверенности
+            strict_match = self.patterns['contacts']['phone_strict'].search(full_text)
+            confidence = 0.95 if strict_match else 0.85
+            
             results['phone'] = {
-                'value': phone_match.group(0),
-                'confidence': 0.95,
-                'method': 'exact_pattern',
-                'source': phone_match.group(0)
+                'value': self._normalize_phone(phone_value),
+                'confidence': confidence,
+                'method': 'pattern_match',
+                'source': phone_value
             }
 
         # Поиск email
@@ -956,6 +994,21 @@ class PrecisionPersonalInfoExtractor:
             'count': len(networks)
         }
 
+    def _normalize_phone(self, phone: str) -> str:
+        """Нормализация номера телефона"""
+        # Удаляем все кроме цифр и +
+        cleaned = re.sub(r'[^\d+]', '', phone)
+        
+        # Российские номера
+        if cleaned.startswith('8') and len(cleaned) == 11:
+            cleaned = '+7' + cleaned[1:]
+        elif cleaned.startswith('7') and len(cleaned) == 11:
+            cleaned = '+' + cleaned
+        elif not cleaned.startswith('+') and len(cleaned) == 10:
+            cleaned = '+7' + cleaned
+            
+        return cleaned
+
     def _calculate_confidence_metrics(self, extraction_log: List[Tuple[str, Dict[str, Any]]]) -> ConfidenceMetrics:
         """Расчет метрик уверенности"""
         field_scores = {}
@@ -1063,31 +1116,66 @@ class MLWorkExperienceExtractor:
         """Умная группировка строк по местам работы"""
         blocks = []
         current_block = []
-
+        
         i = 0
         while i < len(lines):
             line = lines[i].strip()
-
+            
             # Пропускаем общую информацию об опыте
-            if any(keyword in line.lower() for keyword in ['опыт работы', 'общий опыт']) and not self.patterns[
-                'date_range'].search(line):
+            if any(keyword in line.lower() for keyword in ['опыт работы', 'общий опыт']) and not self.patterns['date_range'].search(line):
                 i += 1
                 continue
-
+            
             # Начало нового места работы (дата)
-            if self.patterns['date_range'].search(line):
+            date_match = self.patterns['date_range'].search(line)
+            if date_match:
                 if current_block:
                     blocks.append(current_block)
                 current_block = [line]
             elif current_block:
                 current_block.append(line)
-
+            else:
+                # Если это первая строка без даты, но содержит должность/компанию
+                if self._is_likely_work_entry(line):
+                    current_block = [line]
+                
             i += 1
-
+        
         if current_block:
             blocks.append(current_block)
-
-        return blocks
+        
+        # Фильтрация блоков - удаляем слишком короткие или пустые
+        filtered_blocks = []
+        for block in blocks:
+            if len(block) >= 1 and any(len(line.strip()) > 5 for line in block):
+                filtered_blocks.append(block)
+        
+        return filtered_blocks
+    
+    def _is_likely_work_entry(self, line: str) -> bool:
+        """Проверяет, является ли строка вероятным началом записи о работе"""
+        line_lower = line.lower()
+        
+        # Ключевые слова должностей
+        position_keywords = [
+            'разработчик', 'developer', 'программист', 'engineer', 'архитектор',
+            'тестировщик', 'аналитик', 'менеджер', 'руководитель', 'специалист',
+            'консультант', 'инженер', 'администратор', 'дизайнер'
+        ]
+        
+        # Проверяем наличие ключевых слов должностей
+        for keyword in position_keywords:
+            if keyword in line_lower:
+                return True
+                
+        # Проверяем длину и формат (может быть название компании)
+        if len(line) > 10 and len(line) < 100:
+            # Исключаем строки с техническими терминами (скорее всего описание)
+            tech_keywords = ['html', 'css', 'javascript', 'python', 'java', 'стек', 'технологии']
+            if not any(tech in line_lower for tech in tech_keywords):
+                return True
+                
+        return False
 
     def _parse_work_block(self, block: List[str], block_index: int) -> Optional[WorkExperience]:
         """Высокоточный парсинг блока опыта работы"""
@@ -1206,36 +1294,73 @@ class MLWorkExperienceExtractor:
             'confidence': 0.0,
             'line_index': line_index
         }
-
+        
+        line_lower = line.lower().strip()
+        
+        # Расширенные ключевые слова должностей
+        position_keywords = [
+            'разработчик', 'developer', 'программист', 'engineer', 'архитектор',
+            'тестировщик', 'аналитик', 'менеджер', 'руководитель', 'специалист',
+            'консультант', 'инженер', 'администратор', 'дизайнер', 'lead',
+            'senior', 'junior', 'middle', 'главный', 'ведущий', 'старший'
+        ]
+        
         # Проверка на должность
-        if self.patterns['position_keywords'].search(line):
+        position_score = 0
+        for keyword in position_keywords:
+            if keyword in line_lower:
+                position_score += 1
+                if keyword in ['senior', 'junior', 'middle', 'lead']:
+                    position_score += 0.5  # Дополнительный бонус за уровни
+        
+        if position_score > 0:
             result['is_position'] = True
-            result['confidence'] = 0.9
+            result['confidence'] = min(0.9, 0.6 + position_score * 0.1)
             return result
-
+        
+        # Индикаторы компании
+        company_indicators = [
+            'ооо', 'зао', 'ао', 'пао', 'оао', 'group', 'ltd', 'company', 'corp',
+            'inc', 'ltd.', 'llc', 'гк', 'холдинг', 'банк', 'фонд', 'агентство',
+            'центр', 'институт', 'лаборатория', 'студия'
+        ]
+        
+        # Проверка на компанию
+        company_score = 0
+        for indicator in company_indicators:
+            if indicator in line_lower:
+                company_score += 1
+        
+        # Дополнительные эвристики для компании
+        if len(line.split()) <= 4 and line_index <= 2:  # Короткое название в начале
+            company_score += 0.5
+        if line.isupper() or line.istitle():  # Название заглавными буквами
+            company_score += 0.3
+        if any(char.isdigit() for char in line):  # Содержит цифры (возможно регистрационный номер)
+            company_score += 0.2
+            
         # Проверка на компанию (с возможным городом)
         company_match = self.patterns['company_city'].match(line)
         if company_match:
             company_name = company_match.group(1).strip()
             city = company_match.group(2)
-
-            # Эвристики для определения компании
-            company_indicators = ['ооо', 'зао', 'ао', 'group', 'ltd', 'company', 'corp']
-            if any(indicator in company_name.lower() for indicator in company_indicators):
+            
+            if company_score > 0:
                 result['is_company'] = True
-                result['confidence'] = 0.95
-            elif len(company_name.split()) <= 3 and line_index <= 3:  # Короткое название в начале блока
+                result['confidence'] = min(0.95, 0.7 + company_score * 0.1)
+            elif len(company_name.split()) <= 3 and line_index <= 3:
                 result['is_company'] = True
-                result['confidence'] = 0.8
-
+                result['confidence'] = 0.75
+            
             if city:
                 result['city'] = city
-
-        # Если не определили как должность, скорее всего компания
-        if not result['is_position'] and line_index <= 3:
-            result['is_company'] = True
-            result['confidence'] = max(result['confidence'], 0.6)
-
+        
+        # Если не определили конкретно, используем позицию в блоке
+        if not result['is_position'] and not result['is_company']:
+            if line_index <= 2 and len(line) > 5:  # Первые строки после даты
+                result['is_company'] = True
+                result['confidence'] = 0.6
+        
         return result
 
     def _parse_responsibilities(self, resp_text: str) -> Dict[str, Any]:
@@ -2168,6 +2293,172 @@ class SkillMarketAnalyzer:
         return self.market_demand_scores.get(normalized_name, 0.5)  # Дефолтное значение 0.5
 
 
+class EducationLanguageExtractor:
+    """Экстрактор образования с поддержкой русского языка"""
+    
+    def __init__(self):
+        self.patterns = self._compile_patterns()
+        
+    def _compile_patterns(self) -> Dict[str, re.Pattern]:
+        """Компиляция паттернов для извлечения образования"""
+        return {
+            'institution': re.compile(
+                r'(университет|институт|академия|колледж|школа|гимназия|лицей|техникум|училище)',
+                re.IGNORECASE
+            ),
+            'degree': re.compile(
+                r'(бакалавр|магистр|специалист|аспирант|кандидат наук|доктор наук|MBA)',
+                re.IGNORECASE
+            ),
+            'field_of_study': re.compile(
+                r'(факультет|специальность|направление|кафедра)\s*[:\-]?\s*(.+?)(?:\n|$)',
+                re.IGNORECASE
+            ),
+            'year': re.compile(r'\b(19|20)\d{2}\b'),
+            'graduation': re.compile(
+                r'(окончил|окончила|выпуск|год окончания)\s*[:\-]?\s*(\d{4})',
+                re.IGNORECASE
+            ),
+            'study_period': re.compile(
+                r'(\d{4})\s*[-—]\s*(\d{4})',
+                re.IGNORECASE
+            )
+        }
+    
+    def extract_education(self, segments: Dict[str, Any]) -> Tuple[List[Education], Dict[str, Any]]:
+        """Извлечение образования"""
+        education_lines = segments.get('education', {}).get('lines', [])
+        
+        if not education_lines:
+            return [], {'error': 'no_education_section'}
+            
+        education_entries = []
+        current_education = None
+        parsing_metadata = {'blocks_found': 0, 'parsing_errors': []}
+        
+        for i, line in enumerate(education_lines):
+            line = line.strip()
+            if not line:
+                continue
+                
+            # Поиск учебного заведения
+            institution_match = self.patterns['institution'].search(line)
+            if institution_match and not current_education:
+                current_education = Education()
+                current_education.institution = line
+                parsing_metadata['blocks_found'] += 1
+                continue
+                
+            if current_education:
+                # Поиск специальности/факультета
+                field_match = self.patterns['field_of_study'].search(line)
+                if field_match:
+                    current_education.field_of_study = field_match.group(2).strip()
+                    continue
+                    
+                # Поиск степени
+                degree_match = self.patterns['degree'].search(line)
+                if degree_match:
+                    current_education.degree = degree_match.group(1)
+                    continue
+                    
+                # Поиск годов обучения
+                graduation_match = self.patterns['graduation'].search(line)
+                if graduation_match:
+                    current_education.graduation_date = graduation_match.group(2)
+                    continue
+                    
+                study_period_match = self.patterns['study_period'].search(line)
+                if study_period_match:
+                    current_education.start_date = study_period_match.group(1)
+                    current_education.graduation_date = study_period_match.group(2)
+                    continue
+                    
+                # Поиск года (если не было периода)
+                year_match = self.patterns['year'].search(line)
+                if year_match and not current_education.graduation_date:
+                    current_education.graduation_date = year_match.group(0)
+                    continue
+                    
+                # Если встретили новое учебное заведение, сохраняем текущее
+                new_institution = self.patterns['institution'].search(line)
+                if new_institution:
+                    if current_education.institution:
+                        current_education.confidence_score = self._calculate_education_confidence(current_education)
+                        education_entries.append(current_education)
+                    current_education = Education()
+                    current_education.institution = line
+                    parsing_metadata['blocks_found'] += 1
+        
+        # Добавляем последнее образование
+        if current_education and current_education.institution:
+            current_education.confidence_score = self._calculate_education_confidence(current_education)
+            education_entries.append(current_education)
+            
+        return education_entries, parsing_metadata
+    
+    def _calculate_education_confidence(self, education: Education) -> float:
+        """Расчет уверенности для записи об образовании"""
+        confidence = 0.0
+        
+        if education.institution:
+            confidence += 0.4
+        if education.degree:
+            confidence += 0.2
+        if education.field_of_study:
+            confidence += 0.2
+        if education.graduation_date:
+            confidence += 0.2
+            
+        return min(confidence, 1.0)
+    
+    def extract_languages(self, segments: Dict[str, Any]) -> List:
+        """Извлечение знания языков"""
+        language_lines = segments.get('languages', {}).get('lines', [])
+        
+        if not language_lines:
+            return []
+            
+        languages = []
+        
+        # Простое извлечение языков из текста
+        language_keywords = [
+            'английский', 'english', 'русский', 'russian', 'немецкий', 'german',
+            'французский', 'french', 'испанский', 'spanish', 'китайский', 'chinese',
+            'японский', 'japanese', 'итальянский', 'italian'
+        ]
+        
+        for line in language_lines:
+            line_lower = line.lower()
+            for keyword in language_keywords:
+                if keyword in line_lower:
+                    # Простая структура языка
+                    lang_info = {
+                        'name': keyword.title(),
+                        'proficiency_level': self._extract_proficiency(line),
+                        'confidence_score': 0.8
+                    }
+                    languages.append(lang_info)
+                    break
+                    
+        return languages
+    
+    def _extract_proficiency(self, line: str) -> str:
+        """Извлечение уровня владения языком"""
+        line_lower = line.lower()
+        
+        if any(level in line_lower for level in ['начальный', 'basic', 'a1', 'a2']):
+            return 'Начальный'
+        elif any(level in line_lower for level in ['средний', 'intermediate', 'b1', 'b2']):
+            return 'Средний'
+        elif any(level in line_lower for level in ['продвинутый', 'advanced', 'c1', 'c2', 'свободно']):
+            return 'Продвинутый'
+        elif any(level in line_lower for level in ['родной', 'native']):
+            return 'Родной'
+        else:
+            return 'Не указан'
+
+
 class UltraPreciseResumeParser:
     """Ультра-точный парсер резюме с ML и статистическим анализом"""
 
@@ -2229,7 +2520,7 @@ class UltraPreciseResumeParser:
 
             # 7. Анализ образования и языков
             self.logger.info("🎓 Этап 7: Анализ образования и языков")
-            education = self.education_extractor.extract_education(segments)
+            education, education_metadata = self.education_extractor.extract_education(segments)
             languages = self.education_extractor.extract_languages(segments)
 
             # 8. Дополнительная информация
