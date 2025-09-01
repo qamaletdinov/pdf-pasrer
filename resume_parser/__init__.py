@@ -16,12 +16,14 @@
 __version__ = "1.0.0"
 __author__ = "AI Resume Parser Team"
 
-from .main import UniversalResumeParser
+from .main import UniversalResumeParser, parse_resume, parse_resume_batch
 from .core.data_models import ResumeData, PersonalInfo, Experience, Education, Skill
 from .core.exceptions import ParsingError, FormatNotSupportedError, MLModelError
 
 __all__ = [
     'UniversalResumeParser',
+    'parse_resume', 
+    'parse_resume_batch',
     'ResumeData',
     'PersonalInfo', 
     'Experience',
