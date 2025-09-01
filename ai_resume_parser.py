@@ -827,33 +827,44 @@ class PrecisionPersonalInfoExtractor:
                     'source': line
                 }
 
-            # Поиск даты рождения - пробуем разные паттерны
-            birth_value = None
-            birth_confidence = 0.0
-            birth_source = None
-            
-            # Попробуем все паттерны даты рождения
-            birth_patterns = [
-                ('birth_date', 0.9),           # родился дата
-                ('birth_date_numeric', 0.85),  # родился ДД.ММ.ГГГГ
-                ('birth_date_short', 0.8),     # дата рождения:
-                ('birth_date_simple', 0.7)     # просто ДД.ММ.ГГГГ
-            ]
-            
+        # Поиск даты рождения - сначала в отдельных строках, потом во всем тексте
+        birth_value = None
+        birth_confidence = 0.0
+        birth_source = None
+        
+        # Попробуем все паттерны даты рождения
+        birth_patterns = [
+            ('birth_date', 0.9),           # родился дата
+            ('birth_date_numeric', 0.85),  # родился ДД.ММ.ГГГГ
+            ('birth_date_short', 0.8),     # дата рождения:
+            ('birth_date_simple', 0.7)     # просто ДД.ММ.ГГГГ
+        ]
+        
+        # Сначала ищем в строках
+        for line in lines:
             for pattern_name, confidence in birth_patterns:
                 birth_match = self.patterns['demographics'][pattern_name].search(line)
                 if birth_match and birth_confidence < confidence:
                     birth_value = birth_match.group(1)
                     birth_confidence = confidence
                     birth_source = line
-                    
-            if birth_value:
-                results['birth_date'] = {
-                    'value': birth_value,
-                    'confidence': birth_confidence,
-                    'method': 'pattern_match',
-                    'source': birth_source
-                }
+        
+        # Если не нашли в строках, ищем во всем тексте
+        if not birth_value:
+            for pattern_name, confidence in birth_patterns:
+                birth_match = self.patterns['demographics'][pattern_name].search(full_text)
+                if birth_match and birth_confidence < confidence:
+                    birth_value = birth_match.group(1)
+                    birth_confidence = confidence * 0.9  # Немного снижаем уверенность
+                    birth_source = 'full_text_search'
+                
+        if birth_value:
+            results['birth_date'] = {
+                'value': birth_value,
+                'confidence': birth_confidence,
+                'method': 'pattern_match',
+                'source': birth_source
+            }
 
         return results
 
@@ -2400,6 +2411,52 @@ class EducationLanguageExtractor:
             confidence += 0.2
             
         return min(confidence, 1.0)
+    
+    def extract_languages(self, segments: Dict[str, Any]) -> List:
+        """Извлечение знания языков"""
+        language_lines = segments.get('languages', {}).get('lines', [])
+        
+        if not language_lines:
+            return []
+            
+        languages = []
+        
+        # Простое извлечение языков из текста
+        language_keywords = [
+            'английский', 'english', 'русский', 'russian', 'немецкий', 'german',
+            'французский', 'french', 'испанский', 'spanish', 'китайский', 'chinese',
+            'японский', 'japanese', 'итальянский', 'italian'
+        ]
+        
+        for line in language_lines:
+            line_lower = line.lower()
+            for keyword in language_keywords:
+                if keyword in line_lower:
+                    # Простая структура языка
+                    lang_info = {
+                        'name': keyword.title(),
+                        'proficiency_level': self._extract_proficiency(line),
+                        'confidence_score': 0.8
+                    }
+                    languages.append(lang_info)
+                    break
+                    
+        return languages
+    
+    def _extract_proficiency(self, line: str) -> str:
+        """Извлечение уровня владения языком"""
+        line_lower = line.lower()
+        
+        if any(level in line_lower for level in ['начальный', 'basic', 'a1', 'a2']):
+            return 'Начальный'
+        elif any(level in line_lower for level in ['средний', 'intermediate', 'b1', 'b2']):
+            return 'Средний'
+        elif any(level in line_lower for level in ['продвинутый', 'advanced', 'c1', 'c2', 'свободно']):
+            return 'Продвинутый'
+        elif any(level in line_lower for level in ['родной', 'native']):
+            return 'Родной'
+        else:
+            return 'Не указан'
 
 
 class UltraPreciseResumeParser:
@@ -2463,7 +2520,7 @@ class UltraPreciseResumeParser:
 
             # 7. Анализ образования и языков
             self.logger.info("🎓 Этап 7: Анализ образования и языков")
-            education = self.education_extractor.extract_education(segments)
+            education, education_metadata = self.education_extractor.extract_education(segments)
             languages = self.education_extractor.extract_languages(segments)
 
             # 8. Дополнительная информация
